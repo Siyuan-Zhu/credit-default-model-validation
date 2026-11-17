@@ -4,21 +4,31 @@ Bins are fit on the training split only. Each feature starts from up to
 ``max_bins`` quantile bins (or its distinct values when there are few), then
 adjacent bins are merged until every bin holds at least ``min_bin_frac`` of the
 rows and contains both outcomes. WoE = ln(%good / %bad), so a higher WoE means
-lower risk. Bins are not forced to be monotone; the bin table reports whether
-the bad-rate trend is monotone so a reviewer can judge it.
+lower risk.
+
+Coarse classing then forces a monotone WoE trend. The binner builds two
+candidates, one with WoE increasing in the feature and one decreasing, by
+repeatedly merging the adjacent pair of bins that most violates the trend. It
+keeps the candidate with the higher information value (ties go to the
+direction of the Spearman correlation between feature and target). Everything
+is computed from the rows passed to ``fit``, which is the training split only.
 """
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
 
 class WoEBinner:
-    def __init__(self, max_bins=10, min_bin_frac=0.05, smoothing=0.5):
+    def __init__(self, max_bins=10, min_bin_frac=0.05, smoothing=0.5, monotone=True):
         self.max_bins = max_bins
         self.min_bin_frac = min_bin_frac
         self.smoothing = smoothing
+        self.monotone = monotone
         self.edges_ = {}
         self.woe_ = {}
         self.tables_ = {}
+        self.direction_ = {}
+        self.n_fit_rows_ = 0
 
     # ---- fitting -------------------------------------------------------
     def _initial_edges(self, x):
@@ -54,22 +64,53 @@ class WoEBinner:
             edges.pop(drop)
         return edges
 
-    def fit(self, X, y):
-        y = np.asarray(y, dtype=float)
+    def _woe(self, x, y, edges):
+        """Counts, bads, WoE and IV parts for the bins defined by ``edges``."""
+        idx = self._assign(x, edges)
+        k = len(edges) + 1
+        counts = np.bincount(idx, minlength=k)
+        bads = np.bincount(idx, weights=y, minlength=k)
+        goods = counts - bads
         n_bad, n_good = y.sum(), len(y) - y.sum()
         s = self.smoothing
+        pct_good = (goods + s) / (n_good + s * k)
+        pct_bad = (bads + s) / (n_bad + s * k)
+        woe = np.log(pct_good / pct_bad)
+        return counts, bads, woe, (pct_good - pct_bad) * woe
+
+    def _monotone(self, x, y, edges, sign):
+        """Merge adjacent bins until WoE moves in direction ``sign`` (+1 or -1)."""
+        edges = list(edges)
+        while edges:
+            woe = self._woe(x, y, edges)[2]
+            steps = sign * np.diff(woe)
+            if (steps >= 0).all():
+                break
+            edges.pop(int(np.argmin(steps)))  # merge the worst violating pair
+        return edges
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=float)
+        self.n_fit_rows_ = len(y)
+        self.fit_index_ = X.index.copy()
         for col in X.columns:
             x = X[col].to_numpy(dtype=float)
             edges = self._merge(x, y, self._initial_edges(x))
-            idx = self._assign(x, edges)
+            direction = 0
+            if self.monotone:
+                rho = spearmanr(x, y).statistic if np.ptp(x) > 0 else 0.0
+                rho = 0.0 if np.isnan(rho) else rho
+                cands = []
+                for sign in (1, -1):
+                    e = self._monotone(x, y, edges, sign)
+                    iv = float(self._woe(x, y, e)[3].sum())
+                    # higher IV wins; on a tie prefer the Spearman direction
+                    # (WoE rises with the feature when risk falls with it)
+                    cands.append((round(iv, 10), -sign * rho, sign, e))
+                _, _, direction, edges = max(cands, key=lambda c: (c[0], c[1]))
+            counts, bads, woe, iv_parts = self._woe(x, y, edges)
             k = len(edges) + 1
-            counts = np.bincount(idx, minlength=k)
-            bads = np.bincount(idx, weights=y, minlength=k)
-            goods = counts - bads
-            pct_good = (goods + s) / (n_good + s * k)
-            pct_bad = (bads + s) / (n_bad + s * k)
-            woe = np.log(pct_good / pct_bad)
-            iv_parts = (pct_good - pct_bad) * woe
+            self.direction_[col] = direction
             self.edges_[col] = edges
             self.woe_[col] = woe
             lows = [-np.inf] + edges
@@ -102,12 +143,15 @@ class WoEBinner:
     def iv_table(self):
         rows = []
         for col, t in self.tables_.items():
-            br = t["bad_rate"].to_numpy()
-            diffs = np.diff(br)
-            monotone = bool(np.all(diffs >= 0) or np.all(diffs <= 0))
             rows.append({"feature": col, "iv": t["iv"].sum(), "n_bins": len(t),
-                         "monotone_bad_rate": monotone})
+                         "monotone_woe": _is_monotone(t["woe"]),
+                         "monotone_bad_rate": _is_monotone(t["bad_rate"])})
         return pd.DataFrame(rows).sort_values("iv", ascending=False, ignore_index=True)
+
+
+def _is_monotone(values):
+    d = np.diff(np.asarray(values, dtype=float))
+    return bool(np.all(d >= 0) or np.all(d <= 0))
 
 
 def _fmt(v):

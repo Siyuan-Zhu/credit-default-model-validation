@@ -5,7 +5,7 @@ import pickle
 import pandas as pd
 
 from .config import MODEL_DIR, OUTPUT_DIR, SEED, TABLES_DIR
-from .models import (FEATURES, fit_challenger, fit_champion, load_modeling_frame,
+from .models import (C_GRID, FEATURES, GBM_FIXED, MIN_POINTS_SPREAD, fit_challenger, fit_champion, load_modeling_frame,
                      pd_to_score, predict_challenger, predict_champion, scorecard_points)
 from .warehouse import connect
 
@@ -50,8 +50,10 @@ def main():
     summary = {
         "n_candidate_features": len(FEATURES),
         "champion": {"features": champ["features"], "C": champ["C"],
-                     "valid_auc": champ["valid_auc"]},
-        "challenger": {"params": chall["params"], "valid_auc": chall["valid_auc"]},
+                     "valid_auc": champ["valid_auc"], "c_grid": C_GRID,
+                     "min_points_spread": MIN_POINTS_SPREAD},
+        "challenger": {"params": chall["params"], "fixed_params": GBM_FIXED,
+                       "valid_auc": chall["valid_auc"]},
         "split_counts": df.split.value_counts().to_dict(),
     }
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
