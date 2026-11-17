@@ -1,0 +1,21 @@
+feature,iv,n_bins,monotone_bad_rate,decision,reason
+months_delinquent_m1,0.8680710127504652,3,True,kept,
+n_months_delinquent_6m,0.8115428212875211,4,True,dropped,WoE correlation 0.75 with months_delinquent_m1
+longest_delinq_streak_6m,0.7952780199583644,4,True,dropped,WoE correlation 0.74 with months_delinquent_m1
+current_delinq_streak,0.7217391902119523,3,True,dropped,WoE correlation 0.90 with months_delinquent_m1
+max_months_delinquent_6m,0.7157055149937246,3,True,kept,
+min_pay_ratio_5m,0.3518040422115379,7,False,kept,
+n_months_status_zero_6m,0.28034606993972877,7,False,kept,
+n_months_zero_payment_6m,0.25464492197335775,5,False,kept,
+pay_ratio_m1,0.20758376623051567,8,False,kept,
+credit_limit,0.17809085200831265,10,False,kept,
+avg_util_6m,0.13761798995694619,10,False,kept,
+avg_pay_ratio_5m,0.10839285516650855,9,False,kept,
+max_util_6m,0.10402141312642635,10,False,dropped,WoE correlation 0.85 with avg_util_6m
+util_change_6m,0.0912312298237335,10,False,kept,
+util_m1,0.07652973755474385,10,False,dropped,WoE correlation 0.75 with avg_util_6m
+bill_growth_3m,0.05670583452027519,10,False,kept,
+pay_to_limit_6m,0.052312317915353596,10,False,kept,
+n_months_paid_duly_6m,0.04598108030108243,5,True,kept,
+n_months_over_limit_6m,0.03388047556155989,3,True,kept,
+n_months_status_neg2_6m,0.007623345897964274,3,False,dropped,IV < 0.02
