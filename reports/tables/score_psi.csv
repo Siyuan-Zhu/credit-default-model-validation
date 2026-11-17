@@ -1,5 +1,5 @@
 model,comparison,psi,band
-champion,train vs validation,0.003474689527181142,stable
-champion,train vs test,0.0009673064413352305,stable
+champion,train vs validation,0.0017142878144240335,stable
+champion,train vs test,0.0018840909749697737,stable
 challenger,train vs validation,0.0021484420551197937,stable
 challenger,train vs test,0.001383453053361647,stable
