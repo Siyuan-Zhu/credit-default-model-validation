@@ -14,10 +14,10 @@ pipeline:    ## load raw table, run SQL staging and features
 dq:          ## SQL data-quality checks; exits non-zero on any error-level failure
 	$(RUN) cdmv.dq
 
-models:      ## fit champion and challenger, score every split
+models: dq   ## fit champion and challenger, score every split
 	$(RUN) cdmv.train
 
-validate:    ## performance, calibration, stability, sensitivity tables
+validate: models   ## performance, calibration, stability, sensitivity tables
 	$(RUN) cdmv.validate
 
 figures:     ## reports/figures/*.png
