@@ -11,9 +11,10 @@ import re
 import numpy as np
 import pandas as pd
 
-from .config import OUTPUT_DIR, REPORTS_DIR, ROOT, SQL_DIR, TABLES_DIR
-from .metrics import psi_band
-from .models import BASE_ODDS, BASE_SCORE, CORR_MAX, FEATURES, IV_MIN, PDO
+from .config import OUTPUT_DIR, README, REPORTS_DIR, SQL_DIR, TABLES_DIR
+from .metrics import PSI_REVIEW, PSI_SIGNIFICANT, psi_band
+from .models import (BASE_ODDS, BASE_SCORE, CORR_MAX, FEATURES, IV_MIN, MIN_POINTS_SPREAD,
+                     PDO)
 from .warehouse import connect, query_file
 from .woe import WoEBinner
 
@@ -22,6 +23,12 @@ AUC_MIN, KS_MIN = 0.70, 0.30
 HL_ALPHA = 0.05
 OVERFIT_GAP = 0.015          # train AUC minus test AUC
 NEGLIGIBLE_DROP = 0.0005     # permutation AUC drop below which a feature adds nothing
+RANK_CORR_SIMILAR = 0.90     # Spearman correlation above which two models rank alike
+CUTOFF_BANDS = 2             # riskiest score bands used in the illustrative cutoff
+
+# Illustrative monitoring triggers (common industry conventions, not regulation).
+MON_AUC_DROP = 0.03          # fall in AUC against the validation test result
+MON_CAL_GAP_PP = 2.0         # |mean PD - observed default rate| in percentage points
 
 
 # ---- formatting helpers --------------------------------------------------------
@@ -49,6 +56,12 @@ def md_table(df, align=None):
     for row in df.itertuples(index=False):
         lines.append("| " + " | ".join(str(v) for v in row) + " |")
     return "\n".join(lines)
+
+
+def ordinal(n):
+    n = int(round(n))
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def fmt_range(lo, hi):
@@ -85,6 +98,8 @@ def load():
     d["c_grid"] = t("champion_c_grid.csv")
     d["gbm_grid"] = t("challenger_grid.csv")
     d["segments"] = t("segment_performance_test.csv")
+    d["gains"] = t("gains_champion_test.csv")
+    d["reasons"] = t("reason_codes_examples.csv")
     d["val"] = json.loads((OUTPUT_DIR / "validation.json").read_text())
     d["train"] = json.loads((OUTPUT_DIR / "train_summary.json").read_text())
     return d
@@ -102,20 +117,20 @@ def findings(d):
     champ_te, chall_te = perf_row(d, "champion", "test"), perf_row(d, "challenger", "test")
     champ_feats = d["train"]["champion"]["features"]
 
-    out.append(("Stability", "High",
+    out.append(("Stability", "High", "the missing out-of-time test",
                 "No out-of-time test is possible: the data covers one observation point "
                 "(six monthly snapshots, April to September 2005) and one outcome month. The "
                 "train/test PSI values reported below compare random samples of the same "
                 "population, so they confirm the split, not stability over time.",
                 "Before any use beyond demonstration, test on a later vintage and set PSI "
-                "monitoring triggers (0.10 review, 0.25 redevelop)."))
+                f"monitoring triggers ({PSI_REVIEW:.2f} review, {PSI_SIGNIFICANT:.2f} redevelop)."))
 
     hl = v["calibration"]["champion"]["hosmer_lemeshow"]
     if hl["p_value"] < HL_ALPHA:
         cal = d["cal"][d["cal"].model == "champion"]
         over = cal[cal.diff_pp < 0].decile.tolist()
         under = cal[cal.diff_pp > 0].decile.tolist()
-        out.append(("Calibration", "Medium",
+        out.append(("Calibration", "Medium", "decile-level miscalibration",
                     f"Champion fails the Hosmer-Lemeshow test on test data "
                     f"(chi-square {hl['chi2']:.1f}, {hl['dof']} df, p = {hl['p_value']:.4f}). "
                     f"It over-predicts PD in deciles {_list(over)} and under-predicts in deciles "
@@ -127,37 +142,35 @@ def findings(d):
 
     b = v["bootstrap_test"]
     if b["diff_ci"][0] > 0:
-        out.append(("Benchmark", "Medium",
+        out.append(("Benchmark", "Medium", "the challenger's higher AUC",
                     f"The challenger's test AUC is higher by {b['diff_mean']:.3f} "
                     f"(95% paired bootstrap CI {fmt_range(*b['diff_ci'])}), so the champion's "
                     "simpler form gives up measurable discrimination.",
                     "Document the interpretability trade-off, or test whether interaction terms "
-                    "or coarser, monotone bins close the gap."))
+                    "or segment-level models close the gap."))
     elif b["diff_ci"][1] < 0:
-        out.append(("Benchmark", "Low",
+        out.append(("Benchmark", "Low", "the champion's higher AUC",
                     f"The champion outperforms the challenger on test AUC by {-b['diff_mean']:.3f}.",
                     "No action; retain the champion."))
 
     nonmono = d["iv"][(d["iv"].feature.isin(champ_feats)) & (~d["iv"].monotone_bad_rate)]
     if len(nonmono):
-        out.append(("Methodology", "Medium",
+        out.append(("Methodology", "Medium", "non-monotone bins",
                     f"{len(nonmono)} of {len(champ_feats)} champion features have bins whose bad "
-                    f"rate is not monotone ({_list(nonmono.feature.tolist(), code=True)}). Some "
-                    "reversals reflect real mass points (accounts with no bill or no payment); "
-                    "others look like noise from fine quantile bins.",
+                    f"rate is not monotone ({_list(nonmono.feature.tolist(), code=True)}).",
                     "Coarse-class these features with documented business rationale and refit."))
 
     imp = d["imp"][(d["imp"].model == "champion") & (d["imp"].feature.isin(champ_feats))]
     weak = imp[imp.auc_drop < NEGLIGIBLE_DROP].feature.tolist()
     if weak:
-        out.append(("Methodology", "Low",
+        out.append(("Methodology", "Low", "features with negligible effect",
                     f"{len(weak)} champion features change test AUC by less than {NEGLIGIBLE_DROP} "
                     f"when shuffled ({_list(weak, code=True)}).",
                     "Remove them for parsimony unless they are kept for business reasons."))
 
     gap = perf_row(d, "challenger", "train").auc - chall_te.auc
     if gap > OVERFIT_GAP:
-        out.append(("Performance", "Low",
+        out.append(("Performance", "Low", "challenger overfitting",
                     f"The challenger's train AUC exceeds its test AUC by {gap:.3f}; for the "
                     f"champion the train-minus-test gap is "
                     f"{perf_row(d, 'champion', 'train').auc - champ_te.auc:+.3f}. The challenger "
@@ -170,19 +183,19 @@ def findings(d):
         drops = [f"{int(cal.decile[i])} to {int(cal.decile[i + 1])} "
                  f"({pct(cal.observed_dr[i])} to {pct(cal.observed_dr[i + 1])})"
                  for i in range(len(cal) - 1) if cal.observed_dr[i + 1] < cal.observed_dr[i]]
-        out.append(("Performance", "Low",
+        out.append(("Performance", "Low", "rank-order reversals between deciles",
                     "Observed default rates across champion PD deciles are not strictly "
                     f"increasing: the rate falls from decile {_list(drops)}.",
-                    "Recheck rank ordering in those deciles after coarse classing."))
+                    "Review rank ordering in those deciles before setting cutoffs there."))
 
     st = d["status_share"].set_index("pay_status")["share"]
-    out.append(("Data", "Medium",
+    out.append(("Data", "Medium", "undocumented repayment-status codes",
                 f"Repayment status codes -2 and 0 are not defined in the source documentation but "
                 f"make up {pct(st.get(-2, 0) + st.get(0, 0))} of account-months. The model treats "
                 "them as not delinquent, which is the common reading but is not confirmed.",
                 "Confirm code definitions with the data owner; rerun if the reading changes."))
 
-    out.append(("Governance", "Medium",
+    out.append(("Governance", "Medium", "self-validation",
                 "Development and validation were done by the same person. This report follows "
                 "the structure of an independent validation but is not one.",
                 "Have an independent reviewer repeat the key tests."))
@@ -216,15 +229,17 @@ def report(d):
     dq = d["dq"]
     n_fail = int((dq.status == "FAIL").sum())
     sev_counts = pd.Series([f[1] for f in find]).value_counts()
+    high = [f[2] for f in find if f[1] == "High"]
 
     disc_ok = champ_te.auc >= AUC_MIN and champ_te.ks >= KS_MIN
     s = []
     w = s.append
 
     w("# Model validation report: credit-card probability of default\n")
-    w("> Generated by `make report` from the pipeline outputs. Every figure and number below is "
-      "computed by the code in `src/cdmv/`; nothing is typed in by hand. This is an independent "
-      "portfolio project on public data, written in the format of a model-risk validation.\n")
+    w("> Generated by `make report` from the pipeline outputs. Every number below is computed by "
+      "the code in `src/cdmv/` or set as a named threshold in it; the exceptions are dates, "
+      "citations and general facts about the source data and lending practice. This is an independent portfolio project on public "
+      "data, written in the format of a model-risk validation.\n")
     w(md_table(pd.DataFrame([
         ["Model", "Probability of default (PD), next-month payment default, credit-card accounts"],
         ["Champion", f"{labels['champion']}, {len(champ_feats)} features, scorecard scaling "
@@ -250,14 +265,16 @@ def report(d):
       f"{int((dq.status == 'WARN').sum())} warnings for known, documented issues.\n")
     w(f"The validation raises {len(find)} findings: "
       + ", ".join(f"{sev_counts.get(k, 0)} {k.lower()}" for k in ("High", "Medium", "Low"))
-      + ". The high-severity finding is the absence of an out-of-time test, which the data "
-      "cannot support. The model is suitable as a documented demonstration of PD development "
-      "and validation; it is not approved for decisions on real accounts.\n")
+      + ". "
+      + (f"The high-severity {'finding is' if len(high) == 1 else 'findings are'} "
+         f"{_list(high)}. " if high else "")
+      + "The model is suitable as a documented demonstration of PD development "
+      "and validation; it should not be used for decisions on real accounts.\n")
     w("### Headline metrics (test split)\n")
     w(headline_table(d) + "\n")
     w("### Findings\n")
     w(md_table(pd.DataFrame(
-        [[f"F{i}", a, sev, txt, rec] for i, (a, sev, txt, rec) in enumerate(find, 1)],
+        [[f"F{i}", a, sev, txt, rec] for i, (a, sev, _, txt, rec) in enumerate(find, 1)],
         columns=["ID", "Area", "Severity", "Finding", "Recommendation"]),
         align=["l", "l", "l", "l", "l"]) + "\n")
 
@@ -340,26 +357,46 @@ def report(d):
       "rather than the source jurisdiction's rules.\n")
     w("### 4.2 Champion: weight-of-evidence logistic regression\n")
     binner = WoEBinner()
-    w(f"Each feature is binned on the training split: up to {binner.max_bins} quantile bins (or "
-      f"its distinct values when it has fewer), then adjacent bins are merged until each holds at "
-      f"least {pct(binner.min_bin_frac, 0)} of accounts and contains both outcomes. Each bin is "
+    w(f"Each feature is binned on the training split only: up to {binner.max_bins} quantile bins "
+      f"(or its distinct values when it has fewer), then adjacent bins are merged until each holds "
+      f"at least {pct(binner.min_bin_frac, 0)} of accounts and contains both outcomes. Each bin is "
       "replaced by its weight of evidence, WoE = ln(share of non-defaults / share of defaults), "
-      f"so higher WoE means lower risk. Features with information value (IV) below {IV_MIN} are "
-      f"dropped, then, in order of IV, any feature whose WoE correlates above {CORR_MAX} with an "
-      "already selected feature. Every coefficient must be negative (higher WoE, lower PD); a "
-      "feature with a reversed sign is dropped and the model refit. The L2 penalty C is chosen on "
-      "validation AUC.\n")
+      "so higher WoE means lower risk. Coarse classing then makes WoE monotone in the feature: "
+      "for each direction (WoE rising or falling with the feature), the adjacent pair of bins "
+      "that most breaks the trend is merged until none does, and the direction with the higher "
+      "IV is kept, with ties going to the sign of the Spearman correlation between feature and "
+      f"default. Features with information value (IV) below {IV_MIN} are dropped, then, in order "
+      f"of IV, any feature whose WoE correlates above {CORR_MAX} with an already selected "
+      "feature. Every coefficient must be negative (higher WoE, lower PD); a feature with a "
+      "reversed sign is dropped and the model refit. A feature whose best and worst bins differ "
+      f"by less than {MIN_POINTS_SPREAD:g} scorecard point is also dropped and the model refit, "
+      "since it cannot change any account's score in a visible way. The L2 penalty C is chosen "
+      "on validation AUC.\n")
     iv = d["iv"].copy()
     iv["iv"] = iv.iv.map(f3)
-    iv["monotone_bad_rate"] = iv.monotone_bad_rate.map({True: "yes", False: "no"})
+    for c in ("monotone_woe", "monotone_bad_rate"):
+        iv[c] = iv[c].map({True: "yes", False: "no"})
     iv["reason"] = iv.reason.fillna("")
     w(md_table(iv.rename(columns={"feature": "Feature", "iv": "IV", "n_bins": "Bins",
+                                  "monotone_woe": "Monotone WoE",
                                   "monotone_bad_rate": "Monotone bad rate",
                                   "decision": "Decision", "reason": "Reason"}),
-               align=["l", "r", "r", "l", "l", "l"]) + "\n")
+               align=["l", "r", "r", "l", "l", "l", "l"]) + "\n")
     cg = d["c_grid"].copy()
-    w("Validation AUC by C: " + ", ".join(f"C = {c:g}: {a:.4f}" for c, a in zip(cg.C, cg.valid_auc))
-      + f". Selected C = {tr['champion']['C']:g}.\n")
+    sel_c = tr["champion"]["C"]
+    w("Validation AUC by C for the final feature set: "
+      + ", ".join(f"C = {c:g}: {a:.4f}" for c, a in zip(cg.C, cg.valid_auc))
+      + f". Selected C = {sel_c:g}"
+      + (", the lowest value in the grid" if sel_c == cg.C.min() else
+         ", the highest value in the grid" if sel_c == cg.C.max() else "") + ".\n")
+    bad_c = cg[cg.n_wrong_sign > 0].C.tolist()
+    w("The penalty and the sign check interact. A stronger penalty (smaller C) shrinks "
+      "coefficients toward zero, which can hide a reversed sign caused by correlated WoE inputs "
+      "without removing the correlation, and a weaker penalty can expose it. The sign check is "
+      "applied at the selected C only. With the final feature set, "
+      + (f"coefficients with the wrong sign appear at C = {_list([f'{c:g}' for c in bad_c])}"
+         if bad_c else "no C in the grid produces a coefficient with the wrong sign")
+      + ".\n")
     pts = d["points"].groupby("feature").points.agg(["min", "max"])
     co = d["coefs"].copy()
     co["points range"] = co.feature.map(lambda f: f"{pts.loc[f, 'min']:.0f} to {pts.loc[f, 'max']:.0f}"
@@ -372,8 +409,10 @@ def report(d):
     w("### 4.3 Challenger: gradient boosting\n")
     g = d["gbm_grid"].sort_values("valid_auc", ascending=False)
     p = tr["challenger"]["params"]
+    fx = tr["challenger"]["fixed_params"]
     w(f"scikit-learn `HistGradientBoostingClassifier` on all {tr['n_candidate_features']} raw "
-      "features (no binning), with minimum leaf size 50 and L2 regularisation 1.0. A grid of "
+      f"features (no binning), with minimum leaf size {fx['min_samples_leaf']} and L2 "
+      f"regularisation {fx['l2_regularization']:g}. A grid of "
       f"{len(g)} settings was searched on validation AUC (range {fmt_range(g.valid_auc.min(), g.valid_auc.max())}); "
       f"selected: learning rate {p['learning_rate']}, {p['max_leaf_nodes']} leaves per tree, "
       f"{p['max_iter']} trees. Full grid: `reports/tables/challenger_grid.csv`.\n")
@@ -400,13 +439,41 @@ def report(d):
       f"challenger {chall_te.auc - perf_row(d, 'challenger', 'train').auc:+.3f}.\n")
     w("![ROC curve](figures/roc.png)\n")
     w("![KS](figures/ks.png)\n")
+    gn = d["gains"].copy()
+    w("### 5.1 Score bands\n")
+    w("Champion score bands on the test split, from riskiest (band 1, lowest score) to safest. "
+      "Bands are deciles of predicted PD; cumulative capture is the share of all test defaults "
+      "that fall in this band or a riskier one.\n")
+    gt = pd.DataFrame({
+        "Band": gn.band.astype(int),
+        "Score range": [f"{a:.0f} to {z:.0f}" for a, z in zip(gn.min_score, gn.max_score)],
+        "Accounts": gn.n.map(n0), "Defaults": gn.defaults.map(n0),
+        "Bad rate": gn.bad_rate.map(pct),
+        "Cumulative accounts": gn.cum_share_accounts.map(pct),
+        "Cumulative defaults captured": gn.cum_share_defaults.map(pct)})
+    w(md_table(gt, align=["l", "l", "r", "r", "r", "r", "r"]) + "\n")
+    cut = gn.iloc[CUTOFF_BANDS - 1]
+    rest = gn.iloc[CUTOFF_BANDS:]
+    w(f"Illustrative cutoff: a rule that sends the riskiest {pct(cut.cum_share_accounts, 0)} of "
+      f"accounts (bands 1 to {CUTOFF_BANDS}, scores up to {cut.max_score:.0f}) to a line review "
+      f"would cover "
+      f"{pct(cut.cum_share_defaults)} of test defaults. Those bands have a bad rate of "
+      f"{pct(gn.defaults[:CUTOFF_BANDS].sum() / gn.n[:CUTOFF_BANDS].sum())}, against "
+      f"{pct(rest.defaults.sum() / rest.n.sum())} for the remaining accounts. The cutoff only "
+      "illustrates how the score could be used in account management.\n")
 
     # 6 calibration
     w("## 6. Calibration\n")
-    for m in ("champion", "challenger"):
+    n_groups = int(d["cal"][d["cal"].model == "champion"].shape[0])
+    w(f"Test accounts are grouped into {n_groups} deciles of predicted PD. The Hosmer-Lemeshow "
+      f"statistic is compared with a chi-square distribution on {n_groups} degrees of freedom "
+      "(df = g). The g - 2 rule applies when the groups come from the sample the model was "
+      "fitted on; the test split played no part in fitting or tuning.\n")
+    for k, m in enumerate(("champion", "challenger"), 1):
         c = d["cal"][d["cal"].model == m].copy()
         hl = v["calibration"][m]["hosmer_lemeshow"]
-        w(f"**{labels[m]}**, test split. Hosmer-Lemeshow chi-square {hl['chi2']:.2f} on "
+        w(f"### 6.{k} {labels[m]}\n")
+        w(f"Hosmer-Lemeshow chi-square {hl['chi2']:.2f} on "
           f"{hl['dof']} df, p = {hl['p_value']:.4f} "
           + ("(calibration rejected at 5%)" if hl["p_value"] < HL_ALPHA else "(not rejected at 5%)")
           + f". Largest decile gap {v['calibration'][m]['max_abs_decile_gap_pp']:.1f} pp; top-to-bottom "
@@ -421,8 +488,9 @@ def report(d):
                                      "pd range": "PD range", "mean_pd": "Mean PD",
                                      "observed_dr": "Observed", "diff_pp": "Observed - predicted (pp)"}),
                    align=["l", "r", "r", "l", "r", "r", "r"]) + "\n")
-    w("The Hosmer-Lemeshow test becomes very sensitive at this sample size (600 accounts per "
-      "decile), so small absolute gaps can be statistically significant; the decile tables show "
+    per_decile = int(perf_row(d, "champion", "test").n) // n_groups
+    w(f"The Hosmer-Lemeshow test becomes very sensitive at this sample size ({n0(per_decile)} "
+      "accounts per decile), so small absolute gaps can be statistically significant; the decile tables show "
       "the size and direction of each gap.\n")
     w("![Calibration](figures/calibration.png)\n")
 
@@ -453,7 +521,7 @@ def report(d):
     # 8 sensitivity
     w("## 8. Sensitivity\n")
     w("Permutation importance: the drop in test AUC when one feature's values are shuffled "
-      "(mean of 5 repeats). It measures how much each model relies on a feature, holding the "
+      f"(mean of {v['n_repeats']} repeats). It measures how much each model relies on a feature, holding the "
       "fitted model fixed.\n")
     im = d["imp"].pivot(index="feature", columns="model", values="auc_drop")
     im = im.sort_values("challenger", ascending=False).head(12).reset_index()
@@ -468,9 +536,11 @@ def report(d):
     top_g = d["imp"][d["imp"].model == "challenger"].iloc[0].feature
     lead = (f"Both models rely most on `{top_c}`. " if top_c == top_g else
             f"The champion relies most on `{top_c}` and the challenger on `{top_g}`. ")
+    lo, hi = (ordinal(100 * q) for q in v["pdp_range"])
     w(lead + "The partial-dependence plots below show the mean predicted PD on a "
-      "2,000-account test sample as each of the challenger's top four features is varied across "
-      "its training range, with all other features held at their observed values.\n")
+      f"{n0(v['pdp_sample_n'])}-account test sample as each of the challenger's top "
+      f"{len(v['pdp_features'])} features is varied across the {lo} to {hi} percentile of "
+      "its training values, with all other features held at their observed values.\n")
     rng = d["points"].groupby("feature").points.agg(lambda x: x.max() - x.min()).sort_values(ascending=False)
     w(f"For the champion, the scorecard points range in section 4.2 gives the same view directly: "
       f"`{rng.index[0]}` moves an account's score by up to {rng.iloc[0]:.0f} points, against "
@@ -510,58 +580,106 @@ def report(d):
       f"{fmt_range(*b['diff_ci'])}"
       + (", which excludes zero. " if b["diff_ci"][0] > 0 or b["diff_ci"][1] < 0 else ", which includes zero. ")
       + f"Spearman rank correlation between the two models' PDs on test: {v['spearman_test']:.3f}, "
-      "so the two models largely agree on ordering and differ mainly at the margins. The champion "
-      "is retained as the primary model because each prediction decomposes into points per "
-      "feature, which supports adverse-action reasons and review; the challenger serves as the "
-      "performance benchmark.\n")
+      + (f"above {RANK_CORR_SIMILAR:.2f}, so the two models rank accounts similarly. "
+         if v["spearman_test"] >= RANK_CORR_SIMILAR else
+         f"below {RANK_CORR_SIMILAR:.2f}, so the two models order part of the portfolio "
+         "differently. ")
+      + "The champion is retained as the primary model because each prediction decomposes into "
+      "points per feature, which supports adverse-action reasons and review; the challenger "
+      "serves as the performance benchmark.\n")
+    rc = d["reasons"]
+    n_r = sum(1 for c in rc.columns if c.startswith("reason_"))
+    w(f"Example reason codes. For each feature, points lost is the points of the feature's best "
+      "bin minus the points of the account's bin; the features with the largest loss are the "
+      f"account's top {n_r} reasons. The examples are the test accounts at the "
+      + _list([ordinal(100 * q) for q in rc.pd_quantile]) + " percentiles of champion PD:\n")
+    rt = pd.DataFrame({"Account": rc.account_id.astype(int),
+                       "PD percentile": rc.pd_quantile.map(lambda q: f"{100 * q:.0f}"),
+                       "Score": rc.score.map(lambda x: f"{x:.0f}"), "PD": rc.pd.map(pct)})
+    for k in range(1, n_r + 1):
+        rt[f"Reason {k} (points lost)"] = [
+            f"`{f}` {b} ({x:.0f})" for f, b, x in
+            zip(rc[f"reason_{k}"], rc[f"bin_{k}"], rc[f"points_lost_{k}"])]
+    w(md_table(rt, align=["l", "r", "r", "r"] + ["l"] * n_r) + "\n")
 
     # 10 limitations
     w("## 10. Limitations and model risks\n")
     for item in [
-        "**No out-of-time or out-of-population test.** One observation window and one outcome "
-        "month; performance on later periods, other economic conditions or other portfolios is "
-        "unknown.",
-        "**Old, foreign, single-lender data.** Taiwan, 2005, during a period of high card "
-        "delinquency in that market; behaviour and the credit environment differ from current "
-        "US portfolios.",
-        "**Target definition.** \"Default payment next month\" is not defined in days past due or "
+        "There is no out-of-time or out-of-population test. The data has one observation window "
+        "and one outcome month, so performance on later periods, other economic conditions or "
+        "other portfolios is unknown.",
+        "The data is old and comes from one lender in one market: Taiwan in 2005, during the card "
+        "debt crisis that Yeh and Lien (2009) describe. Behaviour and the credit environment "
+        "differ from current US portfolios.",
+        "The target, \"default payment next month\", is not defined in days past due or "
         "charge-off terms, and the one-month horizon is far shorter than the 12-month horizon "
         "typical for PD models.",
-        "**Undocumented codes.** PAY -2 and 0 dominate the repayment-status fields and their "
-        "meaning is inferred.",
-        "**Payment-timing assumption.** The payment in month m is assumed to settle the "
-        "statement of month m+1 (the previous statement); payment-ratio features depend on it.",
-        "**No macroeconomic or bureau data.** The model cannot respond to economic conditions "
-        "and has no external credit information.",
-        "**Fine-classed bins.** WoE bins come from quantiles, not from reviewed coarse classes; "
-        "some trends are non-monotone.",
-        "**Fairness not tested.** Protected attributes are excluded as inputs, but no disparate-"
-        "impact analysis was done; excluding a field does not remove proxies for it.",
-        "**Self-validation.** The developer and validator are the same person.",
+        "Repayment-status codes -2 and 0 dominate the repayment-status fields and their meaning "
+        "is inferred.",
+        "The payment in month m is assumed to settle the statement of month m+1 (the previous "
+        "statement); the payment-ratio features depend on this.",
+        "The model has no macroeconomic or bureau inputs, so it cannot respond to economic "
+        "conditions and has no external credit information.",
+        "Coarse classing is statistical: bins are merged by rule (minimum size, monotone WoE) "
+        "and have not been reviewed against business rationale.",
+        "Fairness was not tested. Protected attributes are excluded as inputs, but no disparate-"
+        "impact analysis was done, and excluding a field does not remove proxies for it.",
+        "The developer and the validator are the same person.",
     ]:
-        w(f"- {item}")
+        w(f"1. {item}")
     w("")
 
-    # 11 conclusions
-    w("## 11. Conclusions\n")
+    # 11 monitoring
+    w("## 11. Ongoing monitoring plan\n")
+    w("If the model were deployed, it would be monitored as below. The thresholds are common "
+      "industry conventions chosen for illustration; a lender would set its own.\n")
+    w(md_table(pd.DataFrame([
+        ["Score PSI (population stability)", "Monthly",
+         f"{PSI_REVIEW:.2f} or more: review; {PSI_SIGNIFICANT:.2f} or more: consider redevelopment"],
+        ["Feature PSI / CSI (each model feature, on the WoE bins)", "Monthly",
+         f"{PSI_REVIEW:.2f} or more on any feature: investigate the source and its effect on the score"],
+        ["AUC on matured outcomes", "Quarterly",
+         f"Below {AUC_MIN:.2f}, or more than {MON_AUC_DROP:.2f} below the validation test AUC "
+         f"of {f3(champ_te.auc)}: review"],
+        ["Calibration (mean PD vs observed default rate, overall and by decile)", "Quarterly",
+         f"Gap above {MON_CAL_GAP_PP:.0f} pp overall, or Hosmer-Lemeshow p below {HL_ALPHA} on "
+         "the score deciles: recalibrate"],
+        ["Rank ordering (bad rate by score band)", "Quarterly",
+         "Any reversal between adjacent bands: review"],
+        ["Full revalidation", "Annually, or after any trigger above", "Independent review"],
+    ], columns=["Metric", "Frequency", "Illustrative trigger"]), align=["l", "l", "l"]) + "\n")
+
+    # 12 conclusions
+    w("## 12. Conclusions\n")
     hl_c = v["calibration"]["champion"]["hosmer_lemeshow"]
     w(f"1. Data quality: {len(dq)} checks, {n_fail} failures. The known undocumented codes are "
       "handled explicitly and recorded as warnings.")
+    fit_gap = perf_row(d, "champion", "train").auc - champ_te.auc
     w(f"2. Discrimination: the champion's test AUC of {f3(champ_te.auc)} (Gini {f3(champ_te.gini)}, "
       f"KS {f3(champ_te.ks)}) is " + ("adequate" if disc_ok else "below threshold")
-      + " for rank-ordering accounts by risk, and close to its train AUC.")
-    w(f"3. Calibration: overall PD level is accurate ({pct(champ_te.mean_pd)} predicted vs "
-      f"{pct(champ_te.default_rate)} observed), but decile-level calibration is "
+      + " for rank-ordering accounts by risk"
+      + (f", and within {OVERFIT_GAP} of its train AUC ({fit_gap:+.3f} train minus test)."
+         if abs(fit_gap) <= OVERFIT_GAP else
+         f"; its train AUC is {fit_gap:+.3f} away, more than the {OVERFIT_GAP} tolerance."))
+    w(f"3. Calibration: overall PD level is "
+      + ("accurate" if abs(champ_te.mean_pd - champ_te.default_rate) * 100 <= MON_CAL_GAP_PP
+         else "off")
+      + f" ({pct(champ_te.mean_pd)} predicted vs {pct(champ_te.default_rate)} observed), and "
+      "decile-level calibration is "
       + ("rejected" if hl_c["p_value"] < HL_ALPHA else "not rejected")
       + f" (Hosmer-Lemeshow p = {hl_c['p_value']:.4f}).")
     w("4. Stability: PSI values are all "
       f"{psi_band(max(d['score_psi'].psi.max(), d['feat_psi'].psi.max()))}, but this only reflects "
       "a random split; stability over time is untested.")
-    w(f"5. Benchmark: the challenger is more discriminating by {b['diff_mean']:.3f} AUC; the "
-      "champion is kept for interpretability, and the gap is a documented finding.")
+    w(f"5. Benchmark: the challenger's test AUC differs from the champion's by "
+      f"{b['diff_mean']:+.3f} (bootstrap mean); the champion is kept for interpretability, and "
+      "the comparison is a documented finding.")
     w("6. Overall: fit for demonstration and for discussion of methodology. Use on real accounts "
-      "would first require an out-of-time test, recalibration, coarse classing, confirmation of "
-      "code definitions and an independent review.\n")
+      "would first require " + _list(
+          ["an out-of-time test"]
+          + (["recalibration"] if hl_c["p_value"] < HL_ALPHA else [])
+          + ["business review of the bins", "confirmation of code definitions",
+             "an independent review"]) + ".\n")
 
     w("## References\n")
     w("- Yeh, I. (2009). Default of Credit Card Clients [Dataset]. UCI Machine Learning "
@@ -581,6 +699,21 @@ def _find_index(find, area):
     return "?"
 
 
+def findings_sentence(find):
+    """One generated sentence naming the findings count and the most serious ones."""
+    high = [f[2] for f in find if f[1] == "High"]
+    medium = [f[2] for f in find if f[1] == "Medium"]
+    text = f"The report lists {len(find)} findings with recommendations"
+    if high:
+        text += (f"; the most serious {'is' if len(high) == 1 else 'are'} {_list(high)} (high "
+                 "severity)")
+        if medium:
+            text += f", followed by {_list(medium)} (medium)"
+    elif medium:
+        text += f"; the most serious {'is' if len(medium) == 1 else 'are'} {_list(medium)} (medium)"
+    return text + "."
+
+
 def readme_results(d):
     v = d["val"]
     b = v["bootstrap_test"]
@@ -592,7 +725,7 @@ def readme_results(d):
         "",
         headline_table(d),
         "",
-        f"- Challenger minus champion test AUC: {b['diff_mean']:.3f} "
+        f"- Challenger minus champion test AUC (bootstrap mean): {b['diff_mean']:.3f} "
         f"(95% paired bootstrap CI {fmt_range(*b['diff_ci'])}).",
         f"- Champion calibration: mean PD {pct(perf_row(d, 'champion', 'test').mean_pd)} vs observed "
         f"{pct(perf_row(d, 'champion', 'test').default_rate)}; Hosmer-Lemeshow p = {hl['p_value']:.4f}.",
@@ -600,6 +733,8 @@ def readme_results(d):
         "split rather than stability over time).",
         f"- Data quality: {len(d['dq'])} SQL checks, {int((d['dq'].status == 'FAIL').sum())} failures, "
         f"{int((d['dq'].status == 'WARN').sum())} warnings for documented code and balance issues.",
+        "",
+        findings_sentence(findings(d)),
     ]
     n_test = int(d["split"].set_index("split").loc["test", "n"])
     lines[0] = f"Test split ({n_test:,} accounts, not used for fitting or tuning):"
@@ -609,7 +744,7 @@ def readme_results(d):
 def main():
     d = load()
     (REPORTS_DIR / "model_validation.md").write_text(report(d))
-    readme = ROOT / "README.md"
+    readme = README
     if readme.exists():
         text = readme.read_text()
         new = re.sub(r"(<!-- results:start -->\n).*?(<!-- results:end -->)",

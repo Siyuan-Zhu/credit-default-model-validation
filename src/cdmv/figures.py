@@ -11,6 +11,8 @@ import pandas as pd  # noqa: E402
 from sklearn.metrics import roc_curve  # noqa: E402
 
 from .config import FIGURES_DIR, OUTPUT_DIR, TABLES_DIR  # noqa: E402
+from .metrics import ks_statistic  # noqa: E402
+from .report import ordinal  # noqa: E402
 from .warehouse import connect  # noqa: E402
 
 COLORS = {"champion": "#2a78d6", "challenger": "#eb6834"}
@@ -52,15 +54,18 @@ def ks(test, labels):
     for ax, m in zip(axes, COLORS):
         y = test.default_flag.to_numpy()
         s = test[f"pd_{m}"].to_numpy()
+        # KS and its location come from the same ROC computation as the tables
+        value = ks_statistic(y, s)
+        fpr, tpr, thr = roc_curve(y, s)
+        i = int(np.argmax(tpr - fpr))
+        cut, below_bad, below_good = min(thr[i], 1.0), 1 - tpr[i], 1 - fpr[i]
         grid = np.quantile(s, np.linspace(0, 1, 201))
-        cb = [(s[y == 1] <= g).mean() for g in grid]
-        cg = [(s[y == 0] <= g).mean() for g in grid]
-        gap = np.subtract(cg, cb)
-        i = int(np.argmax(gap))
+        cb = [(s[y == 1] < g).mean() for g in grid]
+        cg = [(s[y == 0] < g).mean() for g in grid]
         ax.plot(grid, cg, color=OUTCOME["non-default"], label="Non-defaults (cumulative)")
         ax.plot(grid, cb, color=OUTCOME["default"], label="Defaults (cumulative)")
-        ax.vlines(grid[i], cb[i], cg[i], color=INK, lw=1.2)
-        ax.annotate(f"KS = {gap[i]:.3f}", (grid[i], (cb[i] + cg[i]) / 2), xytext=(8, 0),
+        ax.vlines(cut, below_bad, below_good, color=INK, lw=1.2)
+        ax.annotate(f"KS = {value:.3f}", (cut, (below_bad + below_good) / 2), xytext=(8, 0),
                     textcoords="offset points", va="center", fontsize=8, color=INK,
                     bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE, ec="none"))
         ax.set(xlabel="Predicted PD", title=labels[m], xlim=(0, 1))
@@ -106,7 +111,7 @@ def score_distribution(scores, labels):
     _save(fig, "score_distribution.png")
 
 
-def feature_importance(imp, labels):
+def feature_importance(imp, labels, n_repeats):
     piv = imp.pivot(index="feature", columns="model", values="auc_drop").fillna(0)
     piv = piv.loc[piv.max(axis=1).sort_values().index].tail(14)
     fig, ax = plt.subplots(figsize=(7, 5.4))
@@ -116,21 +121,35 @@ def feature_importance(imp, labels):
         ax.barh(y + (0.5 - k) * h, piv[m].clip(lower=0), height=h - 0.04, color=COLORS[m], label=labels[m])
     ax.set_yticks(y, piv.index)
     ax.grid(axis="y", visible=False)
-    ax.set(xlabel="Drop in test AUC when the feature is shuffled (mean of 5 repeats)",
+    ax.set(xlabel=f"Drop in test AUC when the feature is shuffled (mean of {n_repeats} repeats)",
            title="Permutation importance, test split")
     ax.legend(loc="lower right")
     _save(fig, "feature_importance.png")
 
 
-def partial_dependence(pdp, labels):
+def partial_dependence(pdp, labels, pdp_range):
     feats = list(dict.fromkeys(pdp.feature))
+    lo, hi = (ordinal(100 * q) for q in pdp_range)
     fig, axes = plt.subplots(2, 2, figsize=(9.5, 6.4), sharey=True)
     for ax, f in zip(axes.ravel(), feats):
+        vals = pdp[pdp.feature == f].value
+        # count-like features (small integer range) are drawn as steps with integer ticks
+        integer = bool(np.all(np.mod(vals, 1) == 0) and vals.max() - vals.min() <= 12)
         for m in COLORS:
             t = pdp[(pdp.feature == f) & (pdp.model == m)]
-            ax.plot(t.value, t.mean_pd, color=COLORS[m], marker="o", ms=3, label=labels[m])
-        ax.set(title=f, xlabel="Feature value (2nd to 98th percentile of train)")
-        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}" if abs(v) >= 1000 else f"{v:g}"))
+            if integer:
+                ax.step(t.value, t.mean_pd, where="mid", color=COLORS[m], label=labels[m])
+                ax.plot(t.value, t.mean_pd, ls="none", marker="o", ms=5, color=COLORS[m],
+                        markeredgecolor=SURFACE, markeredgewidth=1.2)
+            else:
+                ax.plot(t.value, t.mean_pd, color=COLORS[m], marker="o", ms=3, label=labels[m])
+        ax.set(title=f, xlabel=f"Feature value ({lo} to {hi} percentile of train)")
+        if integer:
+            ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.0f}"))
+        else:
+            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
+                lambda v, _: f"{v:,.0f}" if abs(v) >= 1000 else f"{v:g}"))
     for ax in axes[:, 0]:
         ax.set_ylabel("Mean predicted PD")
     axes[0, 0].legend()
@@ -142,15 +161,17 @@ def main():
     con = connect()
     scores = con.execute("select * from model.scores").df()
     con.close()
-    labels = json.loads((OUTPUT_DIR / "validation.json").read_text())["labels"]
+    val = json.loads((OUTPUT_DIR / "validation.json").read_text())
+    labels = val["labels"]
     perf = pd.read_csv(TABLES_DIR / "performance.csv")
     test = scores[scores.split == "test"]
     roc(test, labels, perf)
     ks(test, labels)
     calibration(pd.read_csv(TABLES_DIR / "calibration_deciles_test.csv"), labels)
     score_distribution(scores, labels)
-    feature_importance(pd.read_csv(TABLES_DIR / "permutation_importance_test.csv"), labels)
-    partial_dependence(pd.read_csv(TABLES_DIR / "partial_dependence.csv"), labels)
+    feature_importance(pd.read_csv(TABLES_DIR / "permutation_importance_test.csv"), labels,
+                       val["n_repeats"])
+    partial_dependence(pd.read_csv(TABLES_DIR / "partial_dependence.csv"), labels, val["pdp_range"])
     print("figures:", ", ".join(sorted(p.name for p in FIGURES_DIR.glob("*.png"))))
 
 

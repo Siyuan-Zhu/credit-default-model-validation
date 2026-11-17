@@ -54,12 +54,30 @@ def calibration_table(y, p, n_bins=10):
     return t
 
 
-def hosmer_lemeshow(table):
-    """HL chi-square on a decile calibration table, df = bins - 2."""
+def hosmer_lemeshow(table, fitted_on_sample=True):
+    """HL chi-square on a grouped calibration table.
+
+    With g groups, the reference distribution has g - 2 degrees of freedom when
+    the model was fitted on the same sample, and g when the sample is an
+    independent holdout that played no part in fitting.
+    """
     n, o, e = table["n"], table["defaults"], table["mean_pd"] * table["n"]
     chi2 = float((((o - e) ** 2) / (e * (1 - e / n))).sum())
-    dof = len(table) - 2
+    dof = len(table) - 2 if fitted_on_sample else len(table)
     return {"chi2": chi2, "dof": dof, "p_value": float(stats.chi2.sf(chi2, dof))}
+
+
+def gains_table(y, p, n_bins=10):
+    """Risk bands by predicted PD, band 1 = riskiest; cumulative capture of defaults."""
+    df = pd.DataFrame({"y": np.asarray(y), "p": np.asarray(p)})
+    df["band"] = n_bins - pd.qcut(df["p"].rank(method="first"), n_bins, labels=False)
+    t = df.groupby("band").agg(n=("y", "size"), defaults=("y", "sum"),
+                               min_pd=("p", "min"), max_pd=("p", "max")).reset_index()
+    t["defaults"] = t["defaults"].astype(int)
+    t["bad_rate"] = t["defaults"] / t["n"]
+    t["cum_share_accounts"] = t["n"].cumsum() / t["n"].sum()
+    t["cum_share_defaults"] = t["defaults"].cumsum() / t["defaults"].sum()
+    return t
 
 
 def psi(expected, actual, edges=None, n_bins=10, eps=1e-4):
@@ -81,10 +99,13 @@ def psi(expected, actual, edges=None, n_bins=10, eps=1e-4):
     return float(parts.sum()), table
 
 
+PSI_REVIEW, PSI_SIGNIFICANT = 0.10, 0.25
+
+
 def psi_band(value):
     """Conventional reading of PSI."""
-    if value < 0.10:
+    if value < PSI_REVIEW:
         return "stable"
-    if value < 0.25:
+    if value < PSI_SIGNIFICANT:
         return "moderate shift"
     return "significant shift"

@@ -8,13 +8,18 @@ from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 
 from .config import MODEL_DIR, OUTPUT_DIR, SEED, TABLES_DIR
-from .metrics import (bootstrap_auc, calibration_table, hosmer_lemeshow, performance, psi,
-                      psi_band)
-from .models import FEATURES, TARGET, load_modeling_frame, predict_challenger, predict_champion
+from .metrics import (bootstrap_auc, calibration_table, gains_table, hosmer_lemeshow,
+                      performance, psi, psi_band)
+from .models import (FEATURES, TARGET, load_modeling_frame, pd_to_score, predict_challenger,
+                     predict_champion, reason_codes)
 from .warehouse import connect
 
 MODELS = {"champion": predict_champion, "challenger": predict_challenger}
 LABELS = {"champion": "Champion (WoE logistic)", "challenger": "Challenger (gradient boosting)"}
+N_REPEATS = 5                     # permutation-importance repeats
+PDP_SAMPLE = 2000                 # accounts in the partial-dependence sample
+PDP_RANGE = (0.02, 0.98)          # train quantiles spanned by the partial-dependence grid
+REASON_QUANTILES = [0.50, 0.90, 0.95, 0.99]   # PD quantiles of the example accounts
 
 
 def load_artifacts():
@@ -25,7 +30,7 @@ def load_artifacts():
     return arts
 
 
-def permutation_importance(art, predict, df, n_repeats=5, seed=SEED):
+def permutation_importance(art, predict, df, n_repeats=N_REPEATS, seed=SEED):
     rng = np.random.default_rng(seed)
     base = roc_auc_score(df[TARGET], predict(art, df))
     rows = []
@@ -77,7 +82,7 @@ def main():
     cal_rows = []
     for name in MODELS:
         t = calibration_table(test[TARGET], test[f"pd_{name}"])
-        hl = hosmer_lemeshow(t)
+        hl = hosmer_lemeshow(t, fitted_on_sample=False)  # test is an independent holdout
         obs = t["observed_dr"].to_numpy()
         out["calibration"][name] = {
             "hosmer_lemeshow": hl,
@@ -87,6 +92,22 @@ def main():
         }
         cal_rows.append(t.assign(model=name))
     pd.concat(cal_rows).to_csv(TABLES_DIR / "calibration_deciles_test.csv", index=False)
+
+    # gains / score bands for the champion on test (band 1 = riskiest)
+    gains = gains_table(test[TARGET], test.pd_champion)
+    gains["min_score"] = pd_to_score(gains["max_pd"])
+    gains["max_score"] = pd_to_score(gains["min_pd"])
+    gains.to_csv(TABLES_DIR / "gains_champion_test.csv", index=False)
+
+    # adverse-action reason codes for example test accounts at chosen PD quantiles
+    ranked = test.sort_values("pd_champion", ignore_index=True)
+    picks = sorted({min(int(q * len(ranked)), len(ranked) - 1) for q in REASON_QUANTILES})
+    ex = ranked.iloc[picks]
+    rc = reason_codes(arts["champion"], ex)
+    rc.insert(1, "pd_quantile", [i / len(ranked) for i in picks])
+    rc.insert(2, "pd", ex.pd_champion.to_numpy())
+    rc.insert(3, "score", pd_to_score(ex.pd_champion.to_numpy()))
+    rc.to_csv(TABLES_DIR / "reason_codes_examples.csv", index=False)
 
     # score stability (PSI on train deciles of PD)
     score_psi = []
@@ -118,15 +139,18 @@ def main():
 
     # sensitivity: partial dependence for the challenger's top drivers (both models)
     top = imp[imp.model == "challenger"].head(4)["feature"].tolist()
-    sample = test.sample(n=min(2000, len(test)), random_state=SEED)
+    sample = test.sample(n=min(PDP_SAMPLE, len(test)), random_state=SEED)
     pdp = []
     for f in top:
-        grid = np.unique(np.quantile(train[f], np.linspace(0.02, 0.98, 25)))
+        grid = np.unique(np.quantile(train[f], np.linspace(*PDP_RANGE, 25)))
         for name, predict in MODELS.items():
             for g, v in zip(grid, partial_dependence(arts[name], predict, sample, f, grid)):
                 pdp.append({"feature": f, "model": name, "value": float(g), "mean_pd": v})
     pd.DataFrame(pdp).to_csv(TABLES_DIR / "partial_dependence.csv", index=False)
     out["pdp_features"] = top
+    out["pdp_sample_n"] = int(len(sample))
+    out["pdp_range"] = list(PDP_RANGE)
+    out["n_repeats"] = N_REPEATS
 
     # segment performance on test by credit-limit tercile (cut points from train)
     edges = np.quantile(train["credit_limit"], [1 / 3, 2 / 3])
